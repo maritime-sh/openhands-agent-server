@@ -1,0 +1,37 @@
+#!/bin/sh
+# Starts the OpenHands agent server inside a Maritime micro-VM.
+#
+# Maritime forwards the VM's public port (8080) to $PORT, 18789 today, and
+# reaches nothing else from outside. The published agent-server image binds
+# 8000, so this launcher only moves the bind to $PORT and fixes the two things
+# a Maritime VM does differently from a container. Everything else, including
+# deferred init (OH_DEFERRED_INIT / OH_SECRET_KEY) and session API keys
+# (OH_SESSION_API_KEYS_0), is read by the agent server from the environment as
+# usual.
+#
+# Launched directly by tini rather than through `sh -c`: Maritime re-executes
+# an image's ENTRYPOINT and CMD as one flattened string, which a quoted
+# `sh -c` argument does not survive.
+set -eu
+
+# The VM's /etc/hosts starts empty, so `localhost` does not resolve. The agent
+# server and the tools it runs (VS Code, dev servers) expect it to.
+if ! grep -qs '^127\.0\.0\.1[[:space:]].*\blocalhost\b' /etc/hosts; then
+    { echo '127.0.0.1 localhost' >>/etc/hosts; } 2>/dev/null ||
+        echo 'maritime-start: /etc/hosts is not writable; localhost may not resolve' >&2
+fi
+
+# Maritime sets HOME=/data, its persistent volume, so the agent server keeps
+# its state (~/.openhands) across sleep, restarts and redeploys. An older VM
+# can mount /data owned by root, which the image's non-root user cannot write;
+# fall back to the image's own home rather than failing to start.
+if [ -n "${HOME:-}" ] && [ ! -w "$HOME" ]; then
+    echo "maritime-start: HOME=$HOME is not writable; state will not persist" >&2
+    HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
+    export HOME
+fi
+
+exec /usr/local/bin/openhands-agent-server \
+    --host "${MARITIME_AGENT_SERVER_HOST:-0.0.0.0}" \
+    --port "${PORT:-8000}" \
+    "$@"

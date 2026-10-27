@@ -1,0 +1,125 @@
+name: Publish
+
+# Publishes ghcr.io/maritime-sh/openhands-agent-server:<version> for each recent
+# ghcr.io/openhands/agent-server:<version>-python release, so OpenHands can ask
+# for the Maritime image that matches the agent server version it pins.
+#
+# - schedule / workflow_dispatch without input: builds the recent releases that
+#   are not published yet.
+# - push to main: rebuilds the recent releases, to ship a launcher change.
+# - workflow_dispatch with a version: rebuilds that one version.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Agent server version to (re)build, e.g. 1.58.1. Empty builds what is missing."
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: openhands/agent-server
+  IMAGE: ghcr.io/maritime-sh/openhands-agent-server
+  # How many of the newest upstream releases to keep published.
+  RECENT: "8"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.plan.outputs.versions }}
+      latest: ${{ steps.plan.outputs.latest }}
+    steps:
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REQUESTED: ${{ github.event.inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tags() {
+            # Anonymous pull token for a public GHCR repository, then the tag list.
+            local repo="$1" token
+            token=$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r .token)
+            curl -fsS -H "Authorization: Bearer ${token}" \
+              "https://ghcr.io/v2/${repo}/tags/list?n=10000" | jq -r '.tags[]?' || true
+          }
+          upstream=$(tags "$UPSTREAM" | sed -n 's/^\([0-9]\+\.[0-9]\+\.[0-9]\+\)-python$/\1/p' | sort -V)
+          recent=$(echo "$upstream" | tail -n "$RECENT")
+          latest=$(echo "$upstream" | tail -n 1)
+          if [ -n "${REQUESTED:-}" ]; then
+            echo "$upstream" | grep -qx "$REQUESTED" || { echo "No upstream tag ${REQUESTED}-python" >&2; exit 1; }
+            wanted="$REQUESTED"
+          elif [ "$EVENT" = push ]; then
+            wanted="$recent"
+          else
+            published=$(tags "maritime-sh/openhands-agent-server" || true)
+            wanted=$(comm -23 <(echo "$recent" | sort) <(echo "$published" | sort) | sort -V)
+          fi
+          echo "latest=${latest}" >>"$GITHUB_OUTPUT"
+          echo "versions=$(echo "$wanted" | jq -Rnc '[inputs | select(length > 0)]')" >>"$GITHUB_OUTPUT"
+          echo "Upstream latest: ${latest}"
+          echo "To build: $(echo $wanted)"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.versions != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build for the smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: AGENT_SERVER_TAG=${{ matrix.version }}-python
+          tags: smoke:${{ matrix.version }}
+          load: true
+
+      - name: Smoke test
+        run: ./tests/smoke.sh smoke:${{ matrix.version }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Tags
+        id: tags
+        env:
+          VERSION: ${{ matrix.version }}
+          LATEST: ${{ needs.plan.outputs.latest }}
+        run: |
+          tags="${IMAGE}:${VERSION}"
+          if [ "$VERSION" = "$LATEST" ]; then tags="${tags},${IMAGE}:latest"; fi
+          echo "tags=${tags}" >>"$GITHUB_OUTPUT"
+
+      - name: Publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: AGENT_SERVER_TAG=${{ matrix.version }}-python
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true
