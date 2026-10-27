@@ -28,6 +28,7 @@ API = os.environ.get('MARITIME_API_URL', 'https://api.maritime.sh').rstrip('/')
 KEY = os.environ['MARITIME_API_KEY']
 IMAGE = sys.argv[1] if len(sys.argv) > 1 else 'ghcr.io/maritime-sh/openhands-agent-server:latest'
 HEADERS = {'Authorization': f'Bearer {KEY}'}
+ORIGIN = 'https://app.example.com'
 
 
 def step(message: str) -> None:
@@ -86,6 +87,8 @@ async def main() -> int:
                         'initialEnvVars': [
                             {'key': 'OH_DEFERRED_INIT', 'value': '1', 'isSecret': False},
                             {'key': 'OH_SECRET_KEY', 'value': key, 'isSecret': True},
+                            # The agent server reads its CORS policy at boot.
+                            {'key': 'OH_ALLOW_CORS_ORIGINS_0', 'value': ORIGIN, 'isSecret': False},
                         ],
                     },
                 )
@@ -111,7 +114,7 @@ async def main() -> int:
                     'bash_events_dir': '/workspace/bash_events',
                     'conversation_worktree_root': '/workspace/worktrees',
                     'env': {},
-                    'allow_cors_origins': ['https://app.example.com'],
+                    'allow_cors_origins': [ORIGIN],
                 },
             )
             assert response.status_code == 200, f'init: {response.status_code} {response.text}'
@@ -134,7 +137,10 @@ async def main() -> int:
                 },
             )
             allow = preflight.headers.get('access-control-allow-origin')
-            step(f'   CORS preflight: {preflight.status_code} allow-origin={allow}')
+            assert preflight.status_code == 200 and allow == ORIGIN, (
+                f'preflight: {preflight.status_code} allow-origin={allow}'
+            )
+            step('   CORS preflight from the app origin: OK')
 
             ws_url = url.replace('https://', 'wss://') + f'/sockets/bash-events?session_api_key={key}'
             async with websockets.connect(ws_url, open_timeout=30) as ws:
@@ -157,7 +163,10 @@ async def main() -> int:
         finally:
             if agent_id:
                 response = await client.delete(f'{API}/api/agents/{agent_id}', headers=HEADERS)
-                step(f'deleted agent {agent_id}: {response.status_code}')
+                step(f'delete agent {agent_id}: {response.status_code}')
+                if response.status_code not in (200, 204):
+                    print('FAIL: delete needs a key with the manage scope', flush=True)
+                    sys.exit(1)
 
 
 if __name__ == '__main__':

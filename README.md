@@ -40,7 +40,8 @@ curl -X POST https://api.maritime.sh/api/agents \
     "vcpus": 2,
     "initialEnvVars": [
       {"key": "OH_SESSION_API_KEYS_0", "value": "'"$(openssl rand -hex 32)"'", "isSecret": true},
-      {"key": "OH_SECRET_KEY", "value": "'"$(openssl rand -hex 32)"'", "isSecret": true}
+      {"key": "OH_SECRET_KEY", "value": "'"$(openssl rand -hex 32)"'", "isSecret": true},
+      {"key": "OH_ALLOW_CORS_ORIGINS_0", "value": "https://your-app.example.com", "isSecret": false}
     ]
   }'
 ```
@@ -48,7 +49,10 @@ curl -X POST https://api.maritime.sh/api/agents \
 When the agent is `active`, connect Agent Canvas to its `webUrl`
 (`https://<agent-id>.mtm.sh`) with the `OH_SESSION_API_KEYS_0` value as the
 API key. `publicWeb` lets the browser reach the URL; the session API key is
-what protects the agent server.
+what protects the agent server. Set browser origins as `OH_ALLOW_CORS_ORIGINS_<n>`
+at create: the agent server reads its CORS policy at boot, so origins sent later
+on `POST /api/init` do not take effect. The API key needs the `provision`,
+`deploy` and `manage` scopes (`manage` deletes agents).
 
 ## Environment
 
