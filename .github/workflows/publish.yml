@@ -45,30 +45,51 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           REQUESTED: ${{ github.event.inputs.version }}
-          GH_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tags() {
-            # Anonymous pull token for a public GHCR repository, then the tag list.
-            local repo="$1" token
-            token=$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r .token)
-            curl -fsS -H "Authorization: Bearer ${token}" \
-              "https://ghcr.io/v2/${repo}/tags/list?n=10000" | jq -r '.tags[]?' || true
+          # True when the registry has this tag. Upstream is public; our own
+          # repository is read with the workflow token, so it works whether or
+          # not the package is public yet.
+          has_tag() {
+            local repo="$1" tag="$2" token
+            if [ "$repo" = "$UPSTREAM" ]; then
+              token=$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r .token)
+            else
+              token=$(curl -fsS -u "${GHCR_USER}:${GHCR_TOKEN}" \
+                "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r '.token // empty') || true
+              [ -n "$token" ] || return 1
+            fi
+            curl -fsS -o /dev/null -I -H "Authorization: Bearer ${token}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json' \
+              "https://ghcr.io/v2/${repo}/manifests/${tag}"
           }
-          upstream=$(tags "$UPSTREAM" | sed -n 's/^\([0-9]\+\.[0-9]\+\.[0-9]\+\)-python$/\1/p' | sort -V)
+          # GHCR has far too many upstream tags to list (one per commit and
+          # variant), so releases come from PyPI and are checked one by one.
+          releases=$(curl -fsS https://pypi.org/pypi/openhands-agent-server/json \
+            | jq -r '.releases | keys[]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 20)
+          upstream=""
+          for v in $releases; do
+            if has_tag "$UPSTREAM" "${v}-python"; then upstream="${upstream}${v}"$'\n'; fi
+          done
+          upstream=$(printf '%s' "$upstream" | sed '/^$/d' | sort -V)
+          [ -n "$upstream" ] || { echo "Found no upstream releases" >&2; exit 1; }
           recent=$(echo "$upstream" | tail -n "$RECENT")
           latest=$(echo "$upstream" | tail -n 1)
           if [ -n "${REQUESTED:-}" ]; then
-            echo "$upstream" | grep -qx "$REQUESTED" || { echo "No upstream tag ${REQUESTED}-python" >&2; exit 1; }
+            has_tag "$UPSTREAM" "${REQUESTED}-python" || { echo "No upstream tag ${REQUESTED}-python" >&2; exit 1; }
             wanted="$REQUESTED"
           elif [ "$EVENT" = push ]; then
             wanted="$recent"
           else
-            published=$(tags "maritime-sh/openhands-agent-server" || true)
-            wanted=$(comm -23 <(echo "$recent" | sort) <(echo "$published" | sort) | sort -V)
+            wanted=""
+            for v in $recent; do
+              has_tag maritime-sh/openhands-agent-server "$v" || wanted="${wanted}${v}"$'\n'
+            done
           fi
           echo "latest=${latest}" >>"$GITHUB_OUTPUT"
-          echo "versions=$(echo "$wanted" | jq -Rnc '[inputs | select(length > 0)]')" >>"$GITHUB_OUTPUT"
+          echo "versions=$(printf '%s' "$wanted" | jq -Rnc '[inputs | select(length > 0)]')" >>"$GITHUB_OUTPUT"
           echo "Upstream latest: ${latest}"
           echo "To build: $(echo $wanted)"
 
